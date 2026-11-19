@@ -1,0 +1,427 @@
+diff --git a/airdcpp-webapi/web-server/ContextMenuManager.cpp b/airdcpp-webapi/web-server/ContextMenuManager.cpp
+index d447af64..7e52126f 100644
+--- a/airdcpp-webapi/web-server/ContextMenuManager.cpp
++++ b/airdcpp-webapi/web-server/ContextMenuManager.cpp
+@@ -19,12 +19,13 @@
+ #include "stdinc.h"
+ 
+ #include "ContextMenuManager.h"
++#include "HubCommandMenuProvider.h"
+ 
+ 
+ namespace webserver {
+ 	const string ContextMenuManager::URLS_SUPPORT("urls");
+ 
+-	ContextMenuManager::ContextMenuManager() {
++	ContextMenuManager::ContextMenuManager() : hubCommandProvider(make_unique<HubCommandMenuProvider>(*this)) {
+ 
+ 	}
+ 
+diff --git a/airdcpp-webapi/web-server/ContextMenuManager.h b/airdcpp-webapi/web-server/ContextMenuManager.h
+index c5225ab3..68f882bf 100644
+--- a/airdcpp-webapi/web-server/ContextMenuManager.h
++++ b/airdcpp-webapi/web-server/ContextMenuManager.h
+@@ -72,6 +72,8 @@ public:
+ 
+ namespace webserver {
+ 
++class HubCommandMenuProvider;
++
+ class ContextMenuManager : public Speaker<ContextMenuManagerListener>
+ {
+ 
+@@ -111,6 +113,9 @@ public:
+ 
+ 	ContextMenuManager();
+ 	~ContextMenuManager() override;
++private:
++	// Built-in provider for the hub user commands (declared last: destroyed first)
++	unique_ptr<HubCommandMenuProvider> hubCommandProvider;
+ };
+ 
+ } // namespace webserver
+diff --git a/airdcpp-webapi/web-server/HubCommandMenuProvider.cpp b/airdcpp-webapi/web-server/HubCommandMenuProvider.cpp
+new file mode 100644
+index 00000000..0d9ae468
+--- /dev/null
++++ b/airdcpp-webapi/web-server/HubCommandMenuProvider.cpp
+@@ -0,0 +1,305 @@
++/*
++* Copyright (C) 2011-2024 AirDC++ Project
++*
++* This program is free software; you can redistribute it and/or modify
++* it under the terms of the GNU General Public License as published by
++* the Free Software Foundation; either version 3 of the License, or
++* (at your option) any later version.
++*
++* This program is distributed in the hope that it will be useful,
++* but WITHOUT ANY WARRANTY; without even the implied warranty of
++* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++* GNU General Public License for more details.
++*
++* You should have received a copy of the GNU General Public License
++* along with this program; if not, write to the Free Software
++* Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++*/
++
++#include "stdinc.h"
++
++#include "HubCommandMenuProvider.h"
++#include "ContextMenuManager.h"
++
++#include <airdcpp/hub/Client.h>
++#include <airdcpp/hub/ClientManager.h>
++#include <airdcpp/hub/user_command/UserCommandManager.h>
++#include <airdcpp/user/OnlineUser.h>
++#include <airdcpp/user/HintedUser.h>
++#include <airdcpp/util/Util.h>
++
++namespace webserver {
++	using namespace dcpp;
++
++	const string HubCommandMenuProvider::HOOK_ID = "hub_commands";
++
++	namespace {
++		const string PROMPT_PREFIX = "line:";
++		const string KICK_PROMPT_PREFIX = "kickline:";
++		const string COMMAND_ITEM_PREFIX = "uc_";
++
++		string getFormKey(size_t aIndex) noexcept {
++			return "p" + Util::toString(aIndex);
++		}
++
++		// Intermediate tree, since commands use '/' in their names to create submenus
++		struct MenuNode {
++			string title;
++			string id;
++			int commandId = -1;
++			vector<unique_ptr<MenuNode>> children;
++
++			MenuNode* findChild(const string& aTitle) const noexcept {
++				for (const auto& c: children) {
++					if (c->commandId == -1 && c->title == aTitle) {
++						return c.get();
++					}
++				}
++
++				return nullptr;
++			}
++		};
++
++		ContextMenuItemPtr toMenuItem(const MenuNode& aNode, const ActionHookSubscriber& aSubscriber) {
++			ContextMenuItem::List children;
++			for (const auto& c: aNode.children) {
++				children.push_back(toMenuItem(*c, aSubscriber));
++			}
++
++			ExtensionSettingItem::List formFields;
++			if (aNode.commandId != -1) {
++				UserCommand uc;
++				if (UserCommandManager::getInstance()->getUserCommand(aNode.commandId, uc)) {
++					const auto prompts = HubCommandMenuProvider::parsePromptParams(uc.getCommand());
++					for (size_t i = 0; i < prompts.size(); ++i) {
++						// The prompt name is the "line:<title>" key, show only the title
++						const auto sep = prompts[i].find(':');
++						formFields.emplace_back(
++							getFormKey(i),
++							prompts[i].substr(sep + 1),
++							json(""),
++							ApiSettingItem::TYPE_STRING,
++							true // Allow empty values (e.g. kick without a reason)
++						);
++					}
++				}
++			}
++
++			return make_shared<ContextMenuItem>(aNode.id, aNode.title, StringMap(), aSubscriber, StringList(), formFields, children);
++		}
++	}
++
++	HubCommandMenuProvider::HubCommandMenuProvider(ContextMenuManager& aManager) : manager(aManager) {
++		manager.hubMenuHook.addSubscriber(
++			ActionHookSubscriber(HOOK_ID, "Hub commands", nullptr),
++			[this](const vector<ClientToken>& aSelections, const ContextMenuItemListData& aListData, const ResultGetter& aResultGetter) {
++				return onListHubMenu(aSelections, aListData, aResultGetter);
++			}
++		);
++
++		manager.hubUserMenuHook.addSubscriber(
++			ActionHookSubscriber(HOOK_ID, "Hub commands", nullptr),
++			[this](const vector<dcpp::SID>& aSelections, const ContextMenuItemListData& aListData, const ClientPtr& aClient, const ResultGetter& aResultGetter) {
++				return onListHubUserMenu(aSelections, aListData, aClient, aResultGetter);
++			}
++		);
++
++		manager.addListener(this);
++	}
++
++	HubCommandMenuProvider::~HubCommandMenuProvider() {
++		manager.removeListener(this);
++		manager.hubMenuHook.removeSubscriber(HOOK_ID);
++		manager.hubUserMenuHook.removeSubscriber(HOOK_ID);
++	}
++
++	StringList HubCommandMenuProvider::parsePromptParams(const string& aCommand) noexcept {
++		StringList ret;
++
++		string::size_type i = 0;
++		while ((i = aCommand.find("%[", i)) != string::npos) {
++			const auto end = aCommand.find(']', i + 2);
++			if (end == string::npos) {
++				break;
++			}
++
++			const auto name = aCommand.substr(i + 2, end - i - 2);
++			if (name.starts_with(PROMPT_PREFIX) || name.starts_with(KICK_PROMPT_PREFIX)) {
++				// The same prompt may be used multiple times in a command (one value for all of them)
++				if (std::ranges::find(ret, name) == ret.end()) {
++					ret.push_back(name);
++				}
++			}
++
++			i = end + 1;
++		}
++
++		return ret;
++	}
++
++	HubCommandMenuProvider::HookResult HubCommandMenuProvider::onListHubMenu(const vector<ClientToken>& aSelections, const ContextMenuItemListData&, const ResultGetter& aResultGetter) noexcept {
++		if (aSelections.empty()) {
++			return { nullptr, nullptr };
++		}
++
++		// Commands are hub-specific, so a single hub is needed for listing
++		auto client = ClientManager::getInstance()->findClient(aSelections.front());
++		if (!client) {
++			return { nullptr, nullptr };
++		}
++
++		return getMenu(UserCommand::CONTEXT_HUB, client, aResultGetter);
++	}
++
++	HubCommandMenuProvider::HookResult HubCommandMenuProvider::onListHubUserMenu(const vector<dcpp::SID>& aSelections, const ContextMenuItemListData&, const ClientPtr& aClient, const ResultGetter& aResultGetter) noexcept {
++		if (aSelections.empty() || !aClient) {
++			return { nullptr, nullptr };
++		}
++
++		return getMenu(UserCommand::CONTEXT_USER, aClient, aResultGetter);
++	}
++
++	HubCommandMenuProvider::HookResult HubCommandMenuProvider::getMenu(int aContext, const ClientPtr& aClient, const ResultGetter& aResultGetter) noexcept {
++		bool isOp = false;
++		const auto commands = UserCommandManager::getInstance()->getUserCommands(aContext, { aClient->getHubUrl() }, isOp);
++
++		MenuNode root;
++		for (const auto& uc: commands) {
++			if (uc.getType() == UserCommand::TYPE_SEPARATOR || uc.getType() == UserCommand::TYPE_CLEAR || uc.getType() == UserCommand::TYPE_REMOVE) {
++				continue;
++			}
++
++			const auto& path = uc.getDisplayName();
++			if (path.empty()) {
++				continue;
++			}
++
++			auto parent = &root;
++			string folderId = "folder";
++			for (size_t i = 0; i + 1 < path.size(); ++i) {
++				folderId += "/" + path[i];
++
++				auto node = parent->findChild(path[i]);
++				if (!node) {
++					auto newNode = make_unique<MenuNode>();
++					newNode->title = path[i];
++					newNode->id = folderId;
++					node = newNode.get();
++					parent->children.push_back(std::move(newNode));
++				}
++
++				parent = node;
++			}
++
++			auto leaf = make_unique<MenuNode>();
++			leaf->title = path.back();
++			leaf->id = COMMAND_ITEM_PREFIX + Util::toString(uc.getId());
++			leaf->commandId = uc.getId();
++			parent->children.push_back(std::move(leaf));
++		}
++
++		if (root.children.empty()) {
++			return { nullptr, nullptr };
++		}
++
++		ContextMenuItemList items;
++		for (const auto& c: root.children) {
++			items.push_back(toMenuItem(*c, aResultGetter.getSubscriber()));
++		}
++
++		return aResultGetter.getData(
++			make_shared<GroupedContextMenuItem>(HOOK_ID, aResultGetter.getSubscriber().getName(), StringMap(), items)
++		);
++	}
++
++	bool HubCommandMenuProvider::parseCommandId(const string& aMenuItemId, int& id_) noexcept {
++		if (!aMenuItemId.starts_with(COMMAND_ITEM_PREFIX)) {
++			return false;
++		}
++
++		const auto idStr = aMenuItemId.substr(COMMAND_ITEM_PREFIX.size());
++		if (idStr.empty() || idStr.find_first_not_of("0123456789") != string::npos) {
++			return false;
++		}
++
++		id_ = Util::toInt(idStr);
++		return true;
++	}
++
++	void HubCommandMenuProvider::fillPromptParams(const UserCommand& aCommand, const ContextMenuItemClickData& aClickData, ParamMap& params_) noexcept {
++		const auto prompts = parsePromptParams(aCommand.getCommand());
++		for (size_t i = 0; i < prompts.size(); ++i) {
++			string value;
++
++			const auto v = aClickData.formValues.find(getFormKey(i));
++			if (v != aClickData.formValues.end() && v->second.is_string()) {
++				value = v->second.get<string>();
++			}
++
++			params_[prompts[i]] = value;
++		}
++	}
++
++	namespace {
++		// The command must be one that is available for the hub (the item id comes from the client)
++		bool getCommandForHub(int aCommandId, int aContext, const ClientPtr& aClient, UserCommand& uc_) noexcept {
++			bool isOp = false;
++			const auto available = UserCommandManager::getInstance()->getUserCommands(aContext, { aClient->getHubUrl() }, isOp);
++			const auto i = std::ranges::find_if(available, [&](const UserCommand& aCmd) { return aCmd.getId() == aCommandId; });
++			if (i == available.end()) {
++				return false;
++			}
++
++			uc_ = *i;
++			return true;
++		}
++	}
++
++	void HubCommandMenuProvider::on(HubMenuSelected, const vector<ClientToken>& aSelectedIds, const ContextMenuItemClickData& aClickData) noexcept {
++		int commandId;
++		if (aClickData.hookId != HOOK_ID || !parseCommandId(aClickData.menuItemId, commandId)) {
++			return;
++		}
++
++		for (const auto& token: aSelectedIds) {
++			auto client = ClientManager::getInstance()->findClient(token);
++			if (!client) {
++				continue;
++			}
++
++			UserCommand uc;
++			if (!getCommandForHub(commandId, UserCommand::CONTEXT_HUB, client, uc)) {
++				continue;
++			}
++
++			ParamMap params;
++			fillPromptParams(uc, aClickData, params);
++			client->getHubIdentity().getParams(params, "hub", false);
++			client->getMyIdentity().getParams(params, "my", true);
++			client->sendUserCmd(uc, params);
++		}
++	}
++
++	void HubCommandMenuProvider::on(HubUserMenuSelected, const vector<dcpp::SID>& aSelectedIds, const ClientPtr& aClient, const ContextMenuItemClickData& aClickData) noexcept {
++		int commandId;
++		if (aClickData.hookId != HOOK_ID || !parseCommandId(aClickData.menuItemId, commandId) || !aClient) {
++			return;
++		}
++
++		UserCommand uc;
++		if (!getCommandForHub(commandId, UserCommand::CONTEXT_USER, aClient, uc)) {
++			return;
++		}
++
++		for (const auto& sid: aSelectedIds) {
++			auto ou = aClient->findUser(sid);
++			if (!ou) {
++				continue;
++			}
++
++			ParamMap params;
++			fillPromptParams(uc, aClickData, params);
++			UserCommandManager::getInstance()->userCommand(HintedUser(ou->getUser(), aClient->getHubUrl()), uc, params, true);
++		}
++	}
++}
+diff --git a/airdcpp-webapi/web-server/HubCommandMenuProvider.h b/airdcpp-webapi/web-server/HubCommandMenuProvider.h
+new file mode 100644
+index 00000000..b67a6691
+--- /dev/null
++++ b/airdcpp-webapi/web-server/HubCommandMenuProvider.h
+@@ -0,0 +1,68 @@
++/*
++* Copyright (C) 2011-2024 AirDC++ Project
++*
++* This program is free software; you can redistribute it and/or modify
++* it under the terms of the GNU General Public License as published by
++* the Free Software Foundation; either version 3 of the License, or
++* (at your option) any later version.
++*
++* This program is distributed in the hope that it will be useful,
++* but WITHOUT ANY WARRANTY; without even the implied warranty of
++* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++* GNU General Public License for more details.
++*
++* You should have received a copy of the GNU General Public License
++* along with this program; if not, write to the Free Software
++* Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++*/
++
++#ifndef DCPLUSPLUS_WEBSERVER_HUB_COMMAND_MENU_PROVIDER_H
++#define DCPLUSPLUS_WEBSERVER_HUB_COMMAND_MENU_PROVIDER_H
++
++#include "forward.h"
++
++#include "ContextMenuItem.h"
++#include "ContextMenuManagerListener.h"
++
++#include <airdcpp/core/ActionHook.h>
++#include <airdcpp/hub/user_command/UserCommand.h>
++
++namespace webserver {
++
++class ContextMenuManager;
++
++// Exposes the hub user commands (the ones sent by hubs and the ones added by the user)
++// in the "hub" (hub context) and "hub_user" (user context) context menus.
++class HubCommandMenuProvider : private ContextMenuManagerListener {
++public:
++	static const string HOOK_ID;
++
++	explicit HubCommandMenuProvider(ContextMenuManager& aManager);
++	~HubCommandMenuProvider() override;
++
++	HubCommandMenuProvider(const HubCommandMenuProvider&) = delete;
++	HubCommandMenuProvider& operator=(const HubCommandMenuProvider&) = delete;
++
++	// Names of the input prompts (%[line:xxx], %[kickline:xxx]) of a command, in order of appearance
++	static StringList parsePromptParams(const string& aCommand) noexcept;
++private:
++	using ResultGetter = ActionHookResultGetter<GroupedContextMenuItemPtr>;
++	using HookResult = ActionHookResult<GroupedContextMenuItemPtr>;
++
++	HookResult onListHubMenu(const vector<ClientToken>& aSelections, const ContextMenuItemListData& aListData, const ResultGetter& aResultGetter) noexcept;
++	HookResult onListHubUserMenu(const vector<dcpp::SID>& aSelections, const ContextMenuItemListData& aListData, const ClientPtr& aClient, const ResultGetter& aResultGetter) noexcept;
++
++	HookResult getMenu(int aContext, const ClientPtr& aClient, const ResultGetter& aResultGetter) noexcept;
++
++	void on(HubMenuSelected, const vector<ClientToken>& aSelectedIds, const ContextMenuItemClickData& aClickData) noexcept override;
++	void on(HubUserMenuSelected, const vector<dcpp::SID>& aSelectedIds, const ClientPtr& aClient, const ContextMenuItemClickData& aClickData) noexcept override;
++
++	static bool parseCommandId(const string& aMenuItemId, int& id_) noexcept;
++	static void fillPromptParams(const UserCommand& aCommand, const ContextMenuItemClickData& aClickData, ParamMap& params_) noexcept;
++
++	ContextMenuManager& manager;
++};
++
++} // namespace webserver
++
++#endif // DCPLUSPLUS_WEBSERVER_HUB_COMMAND_MENU_PROVIDER_H
