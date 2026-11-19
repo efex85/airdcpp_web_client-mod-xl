@@ -57,6 +57,14 @@ RUN git clone ${daemon_repo} . \
 COPY daemon-hubcommands.patch /tmp/daemon-hubcommands.patch
 RUN git apply --check /tmp/daemon-hubcommands.patch && git apply /tmp/daemon-hubcommands.patch
 
+# The version string normally ends with the suffix that git adds to a modified tree ("-d", e.g. 2.14.1b-91-ge330-d).
+# It is removed by default (empty), giving e.g. 2.14.1b-91-ge330. To add one, use --build-arg version_suffix=-xl
+# (or edit the default here). Keep to letters, digits and "-":
+# the version is also sent to hubs in the client tag, where characters like , < > $ | or spaces cause trouble.
+ARG version_suffix=""
+RUN grep -q -- '--dirty=-d' airdcpp-core/scripts/generate_version.py \
+    && sed -i "s/--dirty=-d/--dirty=${version_suffix}/" airdcpp-core/scripts/generate_version.py
+
 # The web UI is built separately (stage 1), so skip the npm download
 RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DINSTALL_WEB_UI=OFF -DCMAKE_INSTALL_PREFIX=/usr/local \
     && cmake --build build -j"$(nproc)" \
