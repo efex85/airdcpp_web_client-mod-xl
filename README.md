@@ -53,3 +53,5 @@ The built daemon reports its version with a `-d` suffix (e.g. `2.14.1b-91-ge330-
 | `dark.css`, `inject-css.js`   | dark mode                                                              |
 | `entrypoint.sh`, `.airdcpp/`  | container entrypoint and default config                                |
 | `build.sh`                    | local build                                                            |
+
+Available at https://hub.docker.com/r/rafsis/airdcpp-webclient-mod-xl 
