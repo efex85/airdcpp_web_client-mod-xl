@@ -841,3 +841,8 @@ body .private.chat.session .chat.item.mndc.op.bot .caption {
 #sidebar {
   height: 100dvh !important;
 }
+
+/* Keep file/folder names on one line in the tables (search, queue, filelists). Names containing a hyphen
+   (e.g. "9-1-1.S10E06...") otherwise get a line break after the hyphen, and because the table rows
+   are a fixed 50px high the rest of the name was clipped, leaving just "9-1-". Long names now end in "..." */
+.virtual-table .cell-wrapper.name .file-name { white-space: nowrap; }
