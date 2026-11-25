@@ -42,10 +42,10 @@ index c5225ab3..68f882bf 100644
  } // namespace webserver
 diff --git a/airdcpp-webapi/web-server/HubCommandMenuProvider.cpp b/airdcpp-webapi/web-server/HubCommandMenuProvider.cpp
 new file mode 100644
-index 00000000..0d9ae468
+index 00000000..87da253e
 --- /dev/null
 +++ b/airdcpp-webapi/web-server/HubCommandMenuProvider.cpp
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,311 @@
 +/*
 +* Copyright (C) 2011-2024 AirDC++ Project
 +*
@@ -201,6 +201,12 @@ index 00000000..0d9ae468
 +
 +	HubCommandMenuProvider::HookResult HubCommandMenuProvider::onListHubUserMenu(const vector<dcpp::SID>& aSelections, const ContextMenuItemListData&, const ClientPtr& aClient, const ResultGetter& aResultGetter) noexcept {
 +		if (aSelections.empty() || !aClient) {
++			return { nullptr, nullptr };
++		}
++
++		// The commands are run for online users (e.g. a nick in old chat messages may belong to a user who has left the hub)
++		const auto hasOnlineUser = std::ranges::any_of(aSelections, [&](dcpp::SID aSid) { return !!aClient->findUser(aSid); });
++		if (!hasOnlineUser) {
 +			return { nullptr, nullptr };
 +		}
 +
